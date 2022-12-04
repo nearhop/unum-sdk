@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Copyright 2018 Minim Inc
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Utility script for managing a Linux router.
+
+# Run this script to configure the Unum installation and start all the services
+# needed for the operation of a Linux router and wireless access point.
+
+install_dir=${UNUM_INSTALL_ROOT:-/opt/unum}
+
+source "$install_dir/.installed"
+
+install_etc_dir="${install_etc_dir:-/etc/opt/unum}"
+install_var_dir="${install_var_dir:-/var/opt/unum}"
+
+declare -r -x MINIM_LOG_FILE="$install_var_dir/minim-config.log"
+
+usage() {
+    echo "Usage: minim-config [--help|-h] [--no-interactive]"
+    if [[ "$1" == "-v" ]]; then
+        echo
+        echo "Manages configuration for hostapd, dnsmasq, dhcpcd, iptables, and the"
+        echo "unum agent itself."
+        echo
+        echo "This command controls every aspect of the above services, and will generate"
+        echo "configuration files (based on user input when run interactively), modify the"
+        echo "necessary system files, and start the services in the correct order."
+        echo
+        echo "Options:"
+        echo "  --no-interactive   Do not prompt for input; use existing configuration"
+        echo "  --help|-h          Print this usage text"
+    fi
+}
+
+# Init system type (eg. systemd or manual)
+service_type="${service_type:-systemd}"
+# IP related commands (eg. iproute2 or ifconfig)
+iputils_type="${iputils_type:-iproute2}"
+
+# Prints all running pids and command names
+# Usage: pids
+pids() {
+    local f
+    for f in /proc/*; do
+        local pid=${f/\/proc\//}
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+            local exe=$(readlink -e "/proc/$pid/exe")
+            echo "$pid  $exe"
+        fi
+    done
+    return 0
+}
+
+# Prints all pids with command names that match the given input
+# Usage: pids_by_name <name>
+pids_by_name() {
+    echo $(pids | grep $1 | awk 'ORS=" " { print $1 }')
+    return 0
+}
+
+# Start the given service(s)
+# Delegates to a service_type implementation.
+# Usage: start_service <service> [service2 [service3 ...]]
+start_service() {
+    for s in $@; do
+        "start_service__$service_type" "$s" >> "$MINIM_LOG_FILE" 2>&1
+    done
+}
+# Stop the given service(s)
+# Delegates to a service_type implementation.
+# Usage: stop_service <service> [service2 [service3 ...]]
+stop_service() {
+    for s in $@; do
+        "stop_service__$service_type" "$s" >> "$MINIM_LOG_FILE" 2>&1
+    done
+    # Make doubly-sure that none of these are running
+    local pids=$(pids_by_name $@)
+    for pid in $pids; do
+        kill -9 "$pid"
+    done
+}
+# Disable start on boot for the given service(s)
+# Delegates to a service_type implementation.
+# Usage: disable_service <service> [service2 [service3 ...]]
+disable_service() {
+    for s in $@; do
+        "disable_service__$service_type" "$s" >> "$MINIM_LOG_FILE" 2>&1
+    done
+}
+# Disable start on boot for the given service(s)
+# Delegates to a service_type implementation.
+# Usage: enable_service <service> [service2 [service3 ...]]
+enable_service() {
+    for s in $@; do
+        "enable_service__$service_type" "$s" >> "$MINIM_LOG_FILE" 2>&1
+    done
+}
+# Return true or false if the service given appears to be running.
+# Delegates to a service_type implementation.
+# Usage: seems_to_be_running <service>
+seems_to_be_running() {
+    "seems_to_be_running__$service_type" $@ >> "$MINIM_LOG_FILE" 2>&1
+    return $?
+}
+
+# Set the MAC address on the given interface.
+# Delegates to a iputils_type implementation.
+# Usage: set_mac_address <ifname> <hwaddr>
+set_mac_address() {
+    "set_mac_address__$iputils_type" $@ >> "$MINIM_LOG_FILE" 2>&1
+}
+# Change the IP address on the given interface.
+# If ipaddr is not given, the existing address will be removed.
+# Delegates to a iputils_type implementation.
+# Usage: set_ip_address <ifname> [ipaddr]
+set_ip_address() {
+    "set_ip_address__$iputils_type" $@ >> "$MINIM_LOG_FILE" 2>&1
+}
+
+# Actual implementations for service_type "systemd"
+enable_service__systemd() {
+    systemctl enable "$1"
+}
+disable_service__systemd() {
+    systemctl disable "$1"
+}
+start_service__systemd() {
+    service "$1" start
+}
+stop_service__systemd() {
+    service "$1" stop
+}
+seems_to_be_running__systemd() {
+    local chk=$(service "$1" status | grep "active (running)")
+    if [[ -z "$chk" ]]; then
+        return 1
+    fi
+    return 0
+}
+# Actual implementations for service_type "manual"
+enable_service__manual() {
+    echo "notice: manual init option enabled. ignoring enable service command for '$1'"
+    return 0
+}
+disable_service__manual() {
+    echo "notice: manual init option enabled. ignoring disable service command for '$1'"
+    return 0
+}
+start_service__manual() {
+    "start_$1.sh"
+    return $?
+}
+stop_service__manual() {
+    local pids=$(pids_by_name "$1")
+    for pid in $pids; do
+        kill "$pid"
+    done
+    return $?
+}
+seems_to_be_running__manual() {
+    local chk=$(pids_by_name "$1")
+    if [[ -z "$chk" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Actual implementations for iputils_type "iproute2"
+set_mac_address__iproute2() {
+    local ifname="$1"
+    local hwaddr="$2"
+    ip link set "$ifname" down                  >> "$MINIM_LOG_FILE" 2>&1
+    ip link set "$ifname" address "$hwaddr"     >> "$MINIM_LOG_FILE" 2>&1
+    ip link set "$ifname" up                    >> "$MINIM_LOG_FILE" 2>&1
+    return 0
+}
+get_ipcidr__iproute2() {
+    local ifname="$1"
+    ip addr show "$ifname" | awk '/inet6/ { next }; /inet/ { print $2 }'
+    return 0
+}
+set_ip_address__iproute2() {
+    local ifname="$1"
+    local ipaddr="$2"
+    local oldaddr=$(get_ipcidr__iproute2 "$1")
+    if [[ ! -z "$oldaddr" ]]; then
+        ip addr del "$oldaddr" dev "$ifname"
+    fi
+    if [[ ! -z "$ipaddr" ]]; then
+        ip addr add "$ipaddr" dev "$ifname"
+    fi
+    return 0
+}
+
+
+# Actual implementations for iputils_type "ifconfig"
+set_mac_address__ifconfig() {
+    local ifname="$1"
+    local hwaddr="$2"
+    ifconfig "$ifname" down hw addr "$hwaddr" up >> "$MINIM_LOG_FILE" 2>&1
+}
+set_ip_address__ifconfig() {
+    local ifname="$1"
+    local ipaddr="$2"
+    ifconfig "$ifname" "$ipaddr"
+}
+
+
+###
+
+# Parse command-line options
+declare -i interactively=1
+for arg in $@; do
+    case "$arg" in
+        --no-interactive)
+            interactively=0
+            ;;
+        --help|-h|-help)
+            usage -v
+            exit 0
+            ;;
+        *)
+            echo "unsupported option: $arg"
+            usage
+            exit 1
+    esac
+done
+
+# If we are not root already, rerun this script with sudo.
+# It is a bit wasteful to do this here since the new process will have to
+# re-parse options, but this avoids sudo and printing this message when
+# only usage text (--help option) is requested.
+[[ $(id -u) != "0" ]] && \
+    echo "This command requires root privileges, automatically re-running with sudo" && \
+    exec sudo "$0" $@
+
+if (( ! interactively )) && [[ ! -f "$install_etc_dir/extras.conf.sh" ]]; then
+    echo 'unum is unconfigured, please re-run without `--no-interactive`:'
+    echo '    minim-config'
+    exit 1
+fi
+
+echo "Logging to $MINIM_LOG_FILE"
+
+# Return to a known state (nothing running)
+
+echo "Stopping services..." | tee "$MINIM_LOG_FILE"
+
+stop_service hostapd dnsmasq wpa_supplicant unum
+
+# Ensure wifi is enabled if rfkill is installed
+if which rfkill > /dev/null 2>&1; then
+    rfkill unblock wifi >> "$MINIM_LOG_FILE" 2>&1
+fi
+
+
+# Configure the services, interactively if not disabled.
+
+declare interactive_flag=
+if (( ! interactively )); then
+    interactive_flag="--no-interactive"
+fi
+"$install_dir/extras/sbin/config_interfaces.sh" "$interactive_flag"
+"$install_dir/extras/sbin/config_hostapd.sh" "$interactive_flag"
+"$install_dir/extras/sbin/config_dnsmasq.sh"
+"$install_dir/extras/sbin/config_routing.sh"
+
+# Source the extras.conf.sh file to get updated configuration values.
+. "$install_etc_dir/extras.conf.sh"
+
+# Enable the all-in-one service on boot
+enable_service unum-aio
+
+# Disable everything that unum-aio will start
+disable_service unum hostapd dnsmasq
+
+# Disable wpa_supplicant because we are running an access point.
+disable_service wpa_supplicant
+
+sleep 2
+
+
+# Start the services
+
+if (( ! disabled_wlan )); then
+    # Start hostapd first because it must configure the wireless interface before
+    # dnsmasq can bind to it.
+    echo "Starting hostapd..."
+    start_service hostapd
+
+    # Sleep seems to be necessary in between these starts
+    sleep 3
+else
+    echo "no wireless interface configured, not starting hostapd"
+fi
+
+# Set MAC address on the LAN bridge interface after hostapd is started, in case
+# hostapd is responsible for creating the bridge.
+set_mac_address "$ifname_bridge" "$hwaddr_lan"
+# Delete the LAN interface's IP address.
+set_ip_address "$ifname_lan"
+if (( ! disabled_wlan )) && [[ "$ifname_lan" != "$ifname_wlan" ]]; then
+    # Delete the WLAN interface's IP address.
+    set_ip_address "$ifname_wlan"
+fi
+
+sleep 2
+
+echo "Starting dnsmasq..."
+start_service dnsmasq
+
+sleep 3
+
+echo "Starting unum..."
+start_service unum
+
+# Print some diagnostic output to the log file
+if ! seems_to_be_running hostapd; then
+    echo "hostapd is not running" >> "$MINIM_LOG_FILE"
+fi
+if ! seems_to_be_running dnsmasq; then
+    echo "dnsmasq is not running" >> "$MINIM_LOG_FILE"
+fi
+if ! seems_to_be_running unum; then
+    echo "unum is not running" >> "$MINIM_LOG_FILE"
+fi

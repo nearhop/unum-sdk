@@ -1,0 +1,5 @@
+config unum
+
+config router
+	option 'blockmalware' '1'
+	option 'blockadult' '1'
